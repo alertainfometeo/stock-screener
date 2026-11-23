@@ -6,25 +6,32 @@ Puntúa empresas de 0 a 100 según tres pilares:
 - **Salud financiera (30):** ROIC > 15 % y crecimiento del EPS > 10 %
 - **Valuación (35):** PEG forward, P/E, P/FCF y FCF yield
 
-## Cómo usarlo (sin instalar nada)
+## La web
 
-1. Pulsa **Fork** (arriba a la derecha) para tener tu propia copia.
-2. En tu copia, entra en la pestaña **Actions** y pulsa **I understand my workflows, go ahead and enable them**.
-3. Abre **Quality & Valuation Stock Screener** → **Run workflow**.
-   - `false`: lista curada (~40 empresas, 1–2 min)
-   - `true`: S&P 500 + globales (~5 min)
-4. Al terminar, abre el run: el ranking sale en la página y puedes descargar `screener_results.csv` en *Artifacts*.
+Cada sábado por la mañana, con el cierre del viernes, se recalculan todas las empresas cotizadas en EE. UU. según la [lista de la SEC](https://www.sec.gov/files/company_tickers_exchange.json) (NYSE, Nasdaq, CBOE y TXSE, sin OTC, warrants ni preferentes, y con más de 1.000 M$ de capitalización), más una selección global. Se publica en:
+
+- Ranking: `https://alertainfometeo.github.io/stock-screener/`
+- Ficha de una empresa: `https://alertainfometeo.github.io/stock-screener/NVDA`
+
+Para añadir empresas de fuera de EE. UU., mete su ticker de Yahoo Finance en `DEFAULT_TICKERS` dentro de `screener.py`.
+
+## Configuración inicial (una vez)
+
+- **Settings → Pages → Source:** GitHub Actions.
+- **Settings → Secrets and variables → Actions → Variables → New repository variable:** `SEC_USER_AGENT` con tu nombre y email (por ejemplo `Juan Pérez juan@email.com`). La SEC exige identificarse para descargar su lista.
+
+## Actualizarla a mano
+
+**Actions → Quality & Valuation Stock Screener → Run workflow.** Puedes elegir:
+
+- `sec`: todas las cotizadas en EE. UU. (por defecto; entre 20 y 40 minutos repartido en 10 máquinas)
+- `sp500`: S&P 500 y la selección global
+- `curated`: solo la selección global (prueba rápida)
+
+También puedes cambiar la capitalización mínima.
 
 ## Opcional: evaluación con la API de Claude
 
-Si quieres que Claude puntúe los 15 puntos de Fisher en vez de usar indicadores cuantitativos:
-
-1. Consigue una clave en https://console.anthropic.com
-2. En tu copia del repositorio: **Settings → Secrets and variables → Actions → New repository secret**
-3. Nombre: `ANTHROPIC_API_KEY`, valor: tu clave.
-
-Cada usuario usa **su propia clave**; nunca se comparte. Ojo: con el S&P 500 completo son ~500 llamadas a la API por ejecución.
-
-Sin clave, el screener funciona igual con los 15 indicadores fundamentales.
+Añade `ANTHROPIC_API_KEY` en **Settings → Secrets and variables → Actions**. Sin clave, la calidad se mide con 15 indicadores fundamentales. Ojo con el coste: con la lista de la SEC son unas 3.000 llamadas a la API en cada ejecución.
 
 > Herramienta educativa, no es asesoramiento de inversión.

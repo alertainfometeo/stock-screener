@@ -1,11 +1,31 @@
+"""
+Quality & Valuation Stock Screener
+Score 0-100 = Calidad (15 puntos de Phil Fisher) + Salud financiera + Valuación.
+
+Uso:
+  python screener.py universe                 -> universe.json (lista de tickers)
+  python screener.py scan --shard 0 --shards 10  -> shards/shard_0.json
+  python screener.py merge                    -> site/ (web) + screener_results.csv
+  python screener.py                          -> todo seguido (uso local)
+
+Universo (variable UNIVERSE): "sec" (todas las cotizadas en EE. UU. según la SEC,
+por defecto), "sp500" o "curated" (solo DEFAULT_TICKERS).
+"""
 import os
+import re
+import sys
+import glob
 import json
 import time
-import requests
+import argparse
+import datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
+from typing import Dict, Any, List, Optional, Tuple
+
+import requests
 import pandas as pd
 import yfinance as yf
-from typing import Dict, Any, List
 
 # ==============================================================================
 # CONFIGURACIÓN DE GATES Y PESOS (TOTAL = 100 PUNTOS)
@@ -27,10 +47,16 @@ CONFIG = {
         "max_p_fcf": 25.0,        # Price / Free Cash Flow < 25
         "min_fcf_yield": 0.04,    # Free Cash Flow Yield > 4%
     },
-    "min_score_to_display": 60.0, # Mostrar compañías a partir de 60 puntos
+    "min_score_to_display": 60.0,
+    # Universo SEC
+    "sec_url": "https://www.sec.gov/files/company_tickers_exchange.json",
+    "sec_exchanges": {"NYSE", "Nasdaq", "CBOE", "TXSE"},  # fuera OTC
+    # Empresas por debajo de esta capitalización (en su divisa) no se evalúan
+    "min_market_cap": float(os.getenv("MIN_MARKET_CAP", "1000000000")),
+    "workers_per_shard": int(os.getenv("WORKERS", "3")),
 }
 
-# Universo base global (puedes ampliarlo o cargarlo desde un CSV)
+# Universo base global (puedes ampliarlo: cualquier ticker de Yahoo Finance)
 DEFAULT_TICKERS = [
     # US Tech & Quality
     "ADBE", "BKNG", "MSFT", "GOOGL", "AAPL", "META", "NVDA", "V", "MA",
@@ -38,8 +64,26 @@ DEFAULT_TICKERS = [
     # US Consumer, Healthcare & Industrials
     "COST", "UNH", "ISRG", "SYK", "TMO", "DHR", "SPGI", "MCO", "UNP", "CPRT",
     # Europa & Internacional
-    "ASML", "NOVO-B.CO", "LVMH.PA", "RMS.PA", "OR.PA", "ITX.MC", "AMS.MC",
-    "NVO", "TSM", "MELI", "CSU.TO"
+    "ASML", "NVO", "MC.PA", "RMS.PA", "OR.PA", "ITX.MC", "AMS.MC",
+    "TSM", "MELI", "CSU.TO",
+]
+
+FISHER_LABELS = [
+    "Crecimiento de ventas > 8%",
+    "Margen bruto > 45% (pricing power)",
+    "Margen operativo > 18%",
+    "Margen neto > 12%",
+    "ROE > 18%",
+    "ROA > 8%",
+    "Crecimiento de beneficios > 10%",
+    "Free cash flow positivo",
+    "Caja operativa ≥ 90% del beneficio",
+    "Deuda/Patrimonio < 100%",
+    "Liquidez corriente > 1,2",
+    "Insiders > 1% del capital",
+    "Institucionales > 40%",
+    "Margen EBITDA > 22%",
+    "Cotización 52 semanas > -15%",
 ]
 
 
@@ -51,17 +95,100 @@ def get_sp500_tickers() -> List[str]:
         html = requests.get(url, headers=headers, timeout=15).text
         tables = pd.read_html(StringIO(html))
         sp500 = tables[0]["Symbol"].str.replace(".", "-", regex=False).tolist()
-        combined = list(dict.fromkeys(DEFAULT_TICKERS + sp500))
-        return combined
+        return list(dict.fromkeys(DEFAULT_TICKERS + sp500))
     except Exception:
         return DEFAULT_TICKERS
 
 
-def evaluate_fisher_15_points(info: Dict[str, Any], ticker: str) -> float:
+# Sufijos de warrants, units, rights y preferentes en el formato de la SEC
+_SEC_JUNK = re.compile(r"-(WT|WS|W|UN|U|RT|R|P.*)$")
+
+
+def get_sec_tickers() -> List[str]:
     """
-    Evalúa los 15 puntos de Phil Fisher (retorna un ratio entre 0.0 y 1.0).
-    Si existe ANTHROPIC_API_KEY en el entorno, usa Claude para evaluar los 15 puntos;
-    de lo contrario, aplica proxies fundamentales equivalentes.
+    Todas las cotizadas en EE. UU. según la SEC (company_tickers_exchange.json),
+    filtrando OTC, warrants/units/rights/preferentes y clases duplicadas (mismo CIK).
+    La SEC exige un User-Agent con nombre y email de contacto.
+    """
+    ua = os.getenv("SEC_USER_AGENT") or "stock-screener contact@example.com"
+    resp = requests.get(CONFIG["sec_url"], headers={"User-Agent": ua}, timeout=30)
+    resp.raise_for_status()
+    payload = resp.json()
+    fields = payload.get("fields") or ["cik", "name", "ticker", "exchange"]
+    i_cik, i_tk, i_ex = fields.index("cik"), fields.index("ticker"), fields.index("exchange")
+
+    seen_cik, tickers = set(), []
+    for row in payload["data"]:
+        cik, tk, ex = row[i_cik], row[i_tk], row[i_ex]
+        if not tk or ex not in CONFIG["sec_exchanges"]:
+            continue
+        tk = tk.upper().replace(".", "-")
+        if _SEC_JUNK.search(tk):
+            continue
+        # Nasdaq: 5 letras acabadas en W/U/R suelen ser warrants/units/rights
+        if ex == "Nasdaq" and len(tk) == 5 and tk[-1] in "WUR":
+            continue
+        if cik in seen_cik:
+            continue
+        seen_cik.add(cik)
+        tickers.append(tk)
+    return tickers
+
+
+def build_universe() -> List[str]:
+    mode = os.getenv("UNIVERSE", "sec").lower()
+    if mode == "curated":
+        return list(DEFAULT_TICKERS)
+    if mode == "sp500":
+        return get_sp500_tickers()
+    try:
+        sec = get_sec_tickers()
+        print(f"SEC: {len(sec)} tickers tras filtrar")
+        return list(dict.fromkeys(DEFAULT_TICKERS + sec))
+    except Exception as e:
+        print(f"No se pudo leer la lista de la SEC ({e}); uso S&P 500.")
+        return get_sp500_tickers()
+
+
+# ------------------------------------------------------------------------------
+# Divisas: en ADRs y valores extranjeros Yahoo da la capitalización en la divisa
+# de cotización y el free cash flow en la divisa contable. Hay que convertir.
+# ------------------------------------------------------------------------------
+_FX_CACHE: Dict[Tuple[str, str], Optional[float]] = {}
+
+
+def fx_rate(from_ccy: str, to_ccy: str) -> Optional[float]:
+    if not from_ccy or not to_ccy or from_ccy == to_ccy:
+        return 1.0
+    key = (from_ccy, to_ccy)
+    if key not in _FX_CACHE:
+        rate = None
+        try:
+            hist = yf.Ticker(f"{from_ccy}{to_ccy}=X").history(period="5d")
+            if not hist.empty:
+                rate = float(hist["Close"].dropna().iloc[-1])
+        except Exception:
+            rate = None
+        _FX_CACHE[key] = rate
+    return _FX_CACHE[key]
+
+
+def financials_to_price_ccy(info: Dict[str, Any]) -> Optional[float]:
+    """Factor para pasar cifras contables a la divisa de cotización."""
+    price_ccy = info.get("currency") or ""
+    fin_ccy = info.get("financialCurrency") or price_ccy
+    factor = 1.0
+    # Bolsa de Londres cotiza en peniques (GBp)
+    if price_ccy == "GBp":
+        price_ccy, factor = "GBP", 100.0
+    rate = fx_rate(fin_ccy.upper(), price_ccy.upper())
+    return None if rate is None else rate * factor
+
+
+def evaluate_fisher_15_points(info: Dict[str, Any], ticker: str) -> Tuple[float, Optional[List[bool]], str]:
+    """
+    Evalúa los 15 puntos de Phil Fisher. Devuelve (ratio 0-1, checks, método).
+    Si existe ANTHROPIC_API_KEY usa Claude; si no, proxies cuantitativos.
     """
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if api_key:
@@ -91,36 +218,34 @@ def evaluate_fisher_15_points(info: Dict[str, Any], ticker: str) -> float:
                 text = resp.json()["content"][0]["text"]
                 data = json.loads(text[text.find("{"):text.rfind("}") + 1])
                 pts = max(0.0, min(15.0, float(data["puntos_cumplidos"])))
-                return pts / 15.0
+                return pts / 15.0, None, "claude"
         except Exception:
             pass  # Fallback automático a proxies cuantitativos
 
-    # Proxies cuantitativos de los 15 puntos de Phil Fisher (15 criterios = 15 pts)
-    fisher_checks = [
-        (info.get("revenueGrowth") or 0) > 0.08,            # 1. Potencial de crecimiento de ventas
-        (info.get("grossMargins") or 0) > 0.45,             # 2. Ventaja competitiva / pricing power
-        (info.get("operatingMargins") or 0) > 0.18,         # 3. Márgenes operativos superiores
-        (info.get("profitMargins") or 0) > 0.12,            # 4. Rentabilidad neta sostenible
-        (info.get("returnOnEquity") or 0) > 0.18,           # 5. Eficiencia del capital
-        (info.get("returnOnAssets") or 0) > 0.08,           # 6. Productividad de activos
-        (info.get("earningsGrowth") or 0) > 0.10,           # 7. Expansión de beneficios
-        (info.get("freeCashflow") or 0) > 0,                # 8. Conversión real a caja
-        (info.get("operatingCashflow") or 0) > (info.get("netIncomeToCommon") or 0) * 0.9,  # 9. Calidad contable
-        (info.get("debtToEquity") or 999) < 100,            # 10. Solvencia sin dilución forzada
-        (info.get("currentRatio") or 0) > 1.2,              # 11. Liquidez a corto plazo
-        (info.get("heldPercentInsiders") or 0) > 0.01,      # 12. Alineación directiva (skin in the game)
-        (info.get("heldPercentInstitutions") or 0) > 0.40,  # 13. Validación institucional
-        (info.get("ebitdaMargins") or 0) > 0.22,            # 14. Eficiencia operativa estructural
-        (info.get("52WeekChange") or 0) > -0.15,            # 15. Ejecución consistente en mercado
+    g = lambda k, d=0: (info.get(k) if info.get(k) is not None else d)  # noqa: E731
+    checks = [
+        g("revenueGrowth") > 0.08,
+        g("grossMargins") > 0.45,
+        g("operatingMargins") > 0.18,
+        g("profitMargins") > 0.12,
+        g("returnOnEquity") > 0.18,
+        g("returnOnAssets") > 0.08,
+        g("earningsGrowth") > 0.10,
+        g("freeCashflow") > 0,
+        g("operatingCashflow") > g("netIncomeToCommon") * 0.9,
+        g("debtToEquity", 999) < 100,
+        g("currentRatio") > 1.2,
+        g("heldPercentInsiders") > 0.01,
+        g("heldPercentInstitutions") > 0.40,
+        g("ebitdaMargins") > 0.22,
+        g("52WeekChange") > -0.15,
     ]
-    return sum(1 for c in fisher_checks if c) / 15.0
+    checks = [bool(c) for c in checks]
+    return sum(checks) / 15.0, checks, "proxies"
 
 
-def score_step(value: float, target: float, higher_is_better: bool = True, soft_margin: float = 0.25) -> float:
-    """
-    Devuelve 1.0 si cumple el gate estricto, una fracción proporcional si está
-    dentro del margen de tolerancia, y 0.0 si falla por completo.
-    """
+def score_step(value: Optional[float], target: float, higher_is_better: bool = True, soft_margin: float = 0.25) -> float:
+    """1.0 si cumple el gate, fracción si está cerca (margen 25%), 0.0 si falla."""
     if value is None:
         return 0.0
     if higher_is_better:
@@ -130,19 +255,18 @@ def score_step(value: float, target: float, higher_is_better: bool = True, soft_
         if value > floor and target != floor:
             return (value - floor) / (target - floor)
         return 0.0
-    else:
-        if value <= 0:
-            return 0.0
-        if value <= target:
-            return 1.0
-        ceiling = target * (1.0 + soft_margin)
-        if value < ceiling and ceiling != target:
-            return (ceiling - value) / (ceiling - target)
+    if value <= 0:
         return 0.0
+    if value <= target:
+        return 1.0
+    ceiling = target * (1.0 + soft_margin)
+    if value < ceiling and ceiling != target:
+        return (ceiling - value) / (ceiling - target)
+    return 0.0
 
 
 def calculate_roic(stock: yf.Ticker, info: Dict[str, Any]) -> float:
-    """Calcula el ROIC = NOPAT / Capital Invertido."""
+    """ROIC = NOPAT / Capital invertido."""
     try:
         fin = stock.financials
         bs = stock.balance_sheet
@@ -167,42 +291,63 @@ def calculate_roic(stock: yf.Ticker, info: Dict[str, Any]) -> float:
     return 0.0
 
 
-def analyze_ticker(ticker: str) -> Dict[str, Any] | None:
+def _r(x, n=2):
+    return None if x is None else round(float(x), n)
+
+
+def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
     try:
         stock = yf.Ticker(ticker)
-        info = stock.info
-        if not info or "marketCap" not in info or not info["marketCap"]:
+        info = None
+        for attempt in range(3):  # reintentos si Yahoo limita
+            try:
+                info = stock.info
+                break
+            except Exception:
+                time.sleep(5 * (attempt + 1))
+        if not info or not info.get("marketCap"):
             return None
+        if info.get("quoteType") not in (None, "EQUITY"):
+            return None  # fuera ETFs, fondos, etc.
 
         market_cap = float(info["marketCap"])
-        fcf = info.get("freeCashflow")
+        ccy = info.get("currency") or "USD"
+        if ccy == "GBp":
+            conv_usd = (fx_rate("GBP", "USD") or 1.0) / 100.0
+        else:
+            conv_usd = fx_rate(ccy.upper(), "USD") or 1.0
+        if market_cap * conv_usd < CONFIG["min_market_cap"]:
+            return None
+
+        # Free cash flow convertido a la divisa de cotización
+        fcf_raw = info.get("freeCashflow")
+        conv = financials_to_price_ccy(info)
+        fcf = (fcf_raw * conv) if (fcf_raw is not None and conv is not None) else None
+
         pe = info.get("trailingPE") or info.get("forwardPE")
         forward_pe = info.get("forwardPE")
         eps_growth = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth") or 0.0
 
-        # Cálculo de PEG Forward
         peg_forward = info.get("pegRatio")
         if (not peg_forward or peg_forward <= 0) and forward_pe and eps_growth > 0:
             peg_forward = forward_pe / (eps_growth * 100.0)
 
-        # Cálculo de P/FCF y FCF Yield
         p_fcf = (market_cap / fcf) if (fcf and fcf > 0) else None
         fcf_yield = (fcf / market_cap) if (fcf and fcf > 0) else 0.0
 
-        # Cálculo de ROIC
         roic = calculate_roic(stock, info)
 
-        # 1. PILAR CALIDAD (Phil Fisher 15 puntos)
-        fisher_ratio = evaluate_fisher_15_points(info, ticker)
+        # 1. CALIDAD
+        fisher_ratio, fisher_checks, fisher_method = evaluate_fisher_15_points(info, ticker)
         score_quality = fisher_ratio * CONFIG["weights"]["quality_fisher"]
 
-        # 2. PILAR FINANCIAL GATES (ROIC + EPS Growth)
+        # 2. FINANCIAL GATES
         fin_cfg = CONFIG["financial_thresholds"]
-        s_roic = score_step(roic, fin_cfg["min_roic"], higher_is_better=True)
-        s_eps = score_step(eps_growth, fin_cfg["min_eps_growth"], higher_is_better=True)
+        s_roic = score_step(roic, fin_cfg["min_roic"])
+        s_eps = score_step(eps_growth, fin_cfg["min_eps_growth"])
         score_financial = ((s_roic + s_eps) / 2.0) * CONFIG["weights"]["financial_gates"]
 
-        # 3. PILAR VALUACIÓN (PEG Forward, P/E, P/FCF, FCF Yield)
+        # 3. VALUACIÓN
         val_cfg = CONFIG["valuation_thresholds"]
         if peg_forward and peg_forward > 0:
             if peg_forward <= val_cfg["max_peg_strict"]:
@@ -213,70 +358,158 @@ def analyze_ticker(ticker: str) -> Dict[str, Any] | None:
                 s_peg = 0.0
         else:
             s_peg = 0.0
-
         s_pe = score_step(pe, val_cfg["max_pe"], higher_is_better=False)
         s_pfcf = score_step(p_fcf, val_cfg["max_p_fcf"], higher_is_better=False)
-        s_fcf_yield = score_step(fcf_yield, val_cfg["min_fcf_yield"], higher_is_better=True)
-
+        s_fcf_yield = score_step(fcf_yield, val_cfg["min_fcf_yield"])
         score_valuation = ((s_peg + s_pe + s_pfcf + s_fcf_yield) / 4.0) * CONFIG["weights"]["valuation"]
 
         total_score = round(score_quality + score_financial + score_valuation, 1)
 
         return {
-            "Ticker": ticker,
-            "Empresa": info.get("shortName", ticker)[:28],
-            "Score": total_score,
-            "Calidad (35)": round(score_quality, 1),
-            "Finanzas (30)": round(score_financial, 1),
-            "Valuación (35)": round(score_valuation, 1),
-            "ROIC %": round(roic * 100, 1),
-            "EPS Gr %": round(eps_growth * 100, 1),
-            "PEG Fwd": round(peg_forward, 2) if peg_forward else None,
-            "P/E": round(pe, 1) if pe else None,
-            "P/FCF": round(p_fcf, 1) if p_fcf else None,
-            "FCF Yield %": round(fcf_yield * 100, 2),
+            "ticker": ticker,
+            "name": (info.get("shortName") or info.get("longName") or ticker),
+            "sector": info.get("sector"),
+            "country": info.get("country"),
+            "currency": info.get("currency"),
+            "price": _r(info.get("currentPrice") or info.get("regularMarketPrice")),
+            "market_cap": market_cap,
+            "score": total_score,
+            "pillars": {
+                "quality": round(score_quality, 1),
+                "financial": round(score_financial, 1),
+                "valuation": round(score_valuation, 1),
+            },
+            "fisher_method": fisher_method,
+            "fisher_points": round(fisher_ratio * 15, 1),
+            "fisher_checks": fisher_checks,
+            "metrics": [
+                {"group": "financial", "label": "ROIC", "value": _r(roic * 100, 1), "unit": "%", "rule": "> 15%", "score": round(s_roic, 2)},
+                {"group": "financial", "label": "Crecimiento EPS", "value": _r(eps_growth * 100, 1), "unit": "%", "rule": "> 10%", "score": round(s_eps, 2)},
+                {"group": "valuation", "label": "PEG forward", "value": _r(peg_forward), "unit": "", "rule": "< 1,5 (parcial < 2)", "score": round(s_peg, 2)},
+                {"group": "valuation", "label": "P/E", "value": _r(pe, 1), "unit": "", "rule": "< 25", "score": round(s_pe, 2)},
+                {"group": "valuation", "label": "P/FCF", "value": _r(p_fcf, 1), "unit": "", "rule": "< 25", "score": round(s_pfcf, 2)},
+                {"group": "valuation", "label": "FCF yield", "value": _r(fcf_yield * 100, 2), "unit": "%", "rule": "> 4%", "score": round(s_fcf_yield, 2)},
+            ],
         }
     except Exception:
         return None
 
 
-def main():
-    use_full_sp500 = os.getenv("SCAN_FULL_SP500", "false").lower() == "true"
-    tickers = get_sp500_tickers() if use_full_sp500 else DEFAULT_TICKERS
+# ==============================================================================
+# SALIDAS
+# ==============================================================================
+def write_site(results: List[Dict[str, Any]], out_dir: str = "site") -> None:
+    """index.json ligero para el ranking + un JSON por empresa en c/."""
+    os.makedirs(os.path.join(out_dir, "c"), exist_ok=True)
+    index = {
+        "updated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "weights": CONFIG["weights"],
+        "fisher_labels": FISHER_LABELS,
+        "companies": [
+            [r["ticker"], r["name"], r["score"], r["pillars"]["quality"],
+             r["pillars"]["financial"], r["pillars"]["valuation"], r.get("sector")]
+            for r in results
+        ],
+    }
+    with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, separators=(",", ":"))
+    for r in results:
+        with open(os.path.join(out_dir, "c", f"{r['ticker']}.json"), "w", encoding="utf-8") as f:
+            json.dump(r, f, ensure_ascii=False, separators=(",", ":"))
 
-    print(f"Escaneando {len(tickers)} compañías...")
-    results = []
 
-    for idx, ticker in enumerate(tickers, 1):
-        res = analyze_ticker(ticker)
-        if res:
-            results.append(res)
-        if idx % 20 == 0:
-            print(f"Procesadas {idx}/{len(tickers)}...")
-            time.sleep(1.0)  # Evitar rate limit en Yahoo Finance
-
-    df = pd.DataFrame(results)
-    if df.empty:
-        print("No se obtuvieron resultados.")
-        return
-
-    df = df.sort_values(by="Score", ascending=False)
+def write_reports(results: List[Dict[str, Any]]) -> None:
+    df = pd.DataFrame([{
+        "Ticker": r["ticker"],
+        "Empresa": r["name"][:28],
+        "Sector": r.get("sector"),
+        "Score": r["score"],
+        "Calidad (35)": r["pillars"]["quality"],
+        "Finanzas (30)": r["pillars"]["financial"],
+        "Valuación (35)": r["pillars"]["valuation"],
+        **{m["label"]: m["value"] for m in r["metrics"]},
+    } for r in results])
     df.to_csv("screener_results.csv", index=False)
 
     top_df = df[df["Score"] >= CONFIG["min_score_to_display"]]
-    print("\n=== TOP COMPAÑÍAS (SCORE >= 60) ===")
-    print(top_df.to_markdown(index=False))
+    print(f"\n=== {len(df)} compañías evaluadas, {len(top_df)} con score >= {CONFIG['min_score_to_display']:.0f} ===")
+    print(top_df.head(50).to_markdown(index=False))
 
-    # Publicar tabla directamente en el resumen del run de GitHub Actions
     summary_path = os.getenv("GITHUB_STEP_SUMMARY")
     if summary_path:
         with open(summary_path, "a", encoding="utf-8") as f:
             f.write("## Resultados del Screener (Calidad + Salud Financiera + Valuación)\n\n")
-            f.write(f"Compañías analizadas: **{len(df)}** | Con Score ≥ {CONFIG['min_score_to_display']}: **{len(top_df)}**\n\n")
+            f.write(f"Compañías evaluadas: **{len(df)}** | Con Score ≥ {CONFIG['min_score_to_display']:.0f}: **{len(top_df)}**\n\n")
             if not top_df.empty:
-                f.write(top_df.to_markdown(index=False))
+                f.write(top_df.head(200).to_markdown(index=False))
             else:
                 f.write("Ninguna compañía superó el umbral mínimo en esta ejecución.\n")
+
+
+# ==============================================================================
+# PASOS
+# ==============================================================================
+def cmd_universe() -> None:
+    tickers = build_universe()
+    with open("universe.json", "w") as f:
+        json.dump(tickers, f)
+    print(f"Universo: {len(tickers)} tickers")
+
+
+def load_universe() -> List[str]:
+    if os.path.exists("universe.json"):
+        with open("universe.json") as f:
+            return json.load(f)
+    return build_universe()
+
+
+def cmd_scan(shard: int, shards: int) -> None:
+    tickers = load_universe()[shard::shards]
+    print(f"Parte {shard + 1}/{shards}: {len(tickers)} tickers")
+    results, done = [], 0
+    with ThreadPoolExecutor(max_workers=CONFIG["workers_per_shard"]) as pool:
+        for res in pool.map(analyze_ticker, tickers):
+            done += 1
+            if res:
+                results.append(res)
+            if done % 100 == 0:
+                print(f"  {done}/{len(tickers)} procesados, {len(results)} válidos")
+    os.makedirs("shards", exist_ok=True)
+    with open(f"shards/shard_{shard}.json", "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False)
+    print(f"Parte {shard + 1}: {len(results)} empresas evaluadas")
+
+
+def cmd_merge() -> None:
+    results: Dict[str, Dict[str, Any]] = {}
+    for path in glob.glob("shards/**/*.json", recursive=True):
+        with open(path, encoding="utf-8") as f:
+            for r in json.load(f):
+                results[r["ticker"]] = r
+    if not results:
+        print("No se obtuvieron resultados.")
+        sys.exit(1)
+    ordered = sorted(results.values(), key=lambda r: r["score"], reverse=True)
+    write_site(ordered)
+    write_reports(ordered)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("step", nargs="?", default="all", choices=["all", "universe", "scan", "merge"])
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--shards", type=int, default=1)
+    a = ap.parse_args()
+    if a.step == "universe":
+        cmd_universe()
+    elif a.step == "scan":
+        cmd_scan(a.shard, a.shards)
+    elif a.step == "merge":
+        cmd_merge()
+    else:
+        cmd_universe()
+        cmd_scan(0, 1)
+        cmd_merge()
 
 
 if __name__ == "__main__":
