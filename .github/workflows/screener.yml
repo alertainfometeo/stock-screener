@@ -1,0 +1,49 @@
+name: Quality & Valuation Stock Screener
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_full_sp500:
+        description: "Escanear todo el S&P 500 + globales (tarda ~4-5 min)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+  schedule:
+    # Se ejecuta cada lunes a las 08:00 UTC
+    - cron: "0 8 * * 1"
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Ejecutar Screener Algorítmico
+        env:
+          SCAN_FULL_SP500: ${{ github.event.inputs.scan_full_sp500 || 'false' }}
+          # Opcional: añade ANTHROPIC_API_KEY en Settings > Secrets > Actions
+          # para que Claude evalúe cualitativamente los 15 puntos de Phil Fisher
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python screener.py
+
+      - name: Guardar resultados en CSV (Artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-ranking-${{ github.run_number }}
+          path: screener_results.csv
