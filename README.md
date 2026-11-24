@@ -4,9 +4,10 @@ Puntúa empresas cotizadas de **0 a 100** combinando tres pilares:
 
 | Pilar | Peso | Qué mide |
 |---|---:|---|
-| Calidad (15 puntos de Phil Fisher) | 35 | Crecimiento, márgenes, rentabilidad, solidez del balance |
+| Calidad (15 puntos de Phil Fisher) | 30 | Crecimiento, márgenes, rentabilidad, solidez del balance |
 | Salud financiera | 30 | ROIC y crecimiento del beneficio por acción |
-| Valuación | 35 | PEG forward, P/E, P/FCF y FCF yield |
+| Valuación | 30 | PEG forward, P/E, P/FCF y FCF yield |
+| Previsiones de analistas | 10 | Crecimiento del EPS previsto y revisiones de las previsiones |
 
 Una empresa que cumple todos los criterios saca 100 y una que no cumple ninguno saca 0. Entre medias, cada criterio suma su parte, con puntuación parcial cuando una empresa se queda cerca del umbral.
 
@@ -74,7 +75,7 @@ Casi todos los criterios se puntúan con la misma regla, que da **1** si se cump
 
 Por ejemplo, con un ROIC del 13,5 % frente a un umbral del 15 %, el margen empieza en 11,25 % y la nota es (13,5 − 11,25) / 3,75 = **0,6**.
 
-### 2.2 Calidad: 15 puntos de Phil Fisher (35 puntos)
+### 2.2 Calidad: 15 puntos de Phil Fisher (30 puntos)
 
 Fisher evaluaba sobre todo aspectos cualitativos: el equipo directivo, la I+D, la red comercial o las relaciones laborales. Aquí se aproximan con **15 indicadores cuantitativos** de Yahoo. Cada uno que se cumple suma 1 punto de 15.
 
@@ -86,7 +87,7 @@ Fisher evaluaba sobre todo aspectos cualitativos: el equipo directivo, la I+D, l
 | 4 | Margen neto | `profitMargins` | > 12 % |
 | 5 | Rentabilidad sobre el patrimonio | `returnOnEquity` | > 18 % |
 | 6 | Rentabilidad sobre activos | `returnOnAssets` | > 8 % |
-| 7 | Crecimiento de beneficios | `earningsGrowth` | > 10 % |
+| 7 | Crecimiento de beneficios | Crecimiento EPS medio de 3 años (ver 2.3) | > 10 % |
 | 8 | Generación de caja | `freeCashflow` | > 0 |
 | 9 | Calidad contable | `operatingCashflow` vs `netIncomeToCommon` | caja operativa > 90 % del beneficio neto |
 | 10 | Solvencia | `debtToEquity` | < 100 % |
@@ -96,7 +97,7 @@ Fisher evaluaba sobre todo aspectos cualitativos: el equipo directivo, la I+D, l
 | 14 | Eficiencia operativa | `ebitdaMargins` | > 22 % |
 | 15 | Comportamiento en bolsa | `52WeekChange` | > −15 % en 12 meses |
 
-**Puntos de calidad = (criterios cumplidos / 15) × 35.** Aquí no hay puntuación parcial: cada criterio se cumple o no. Si falta un dato, cuenta como no cumplido.
+**Puntos de calidad = (criterios cumplidos / 15) × 30.** Aquí no hay puntuación parcial: cada criterio se cumple o no. Si falta un dato, cuenta como no cumplido.
 
 **Modo opcional con Claude:** si existe el secret `ANTHROPIC_API_KEY`, en lugar de los 15 indicadores se pide a Claude que puntúe la empresa de 0 a 15 según los criterios de Fisher, y el número que devuelve sustituye al recuento. Claude responde de memoria, sin recibir los datos de la empresa, así que su nota no es reproducible ni auditable. Si la llamada falla, se usan los indicadores. Con la lista de la SEC son unas 3.000 llamadas por ejecución.
 
@@ -105,7 +106,7 @@ Fisher evaluaba sobre todo aspectos cualitativos: el equipo directivo, la I+D, l
 | Criterio | Umbral | Cálculo |
 |---|---|---|
 | **ROIC** | > 15 % | Ver abajo |
-| **Crecimiento del EPS** | > 10 % | `earningsGrowth` de Yahoo; si falta, `earningsQuarterlyGrowth`; si tampoco hay, 0 |
+| **Crecimiento del EPS** | > 10 % | Media de los crecimientos anuales del EPS diluido de los últimos 3 años (4 ejercicios de `Ticker.financials`). Los años con EPS de partida cero o negativo se saltan. Sin histórico anual, se usa `earningsGrowth` de Yahoo (trimestral) |
 
 **ROIC = NOPAT / Capital invertido**, con datos del último ejercicio anual:
 
@@ -118,7 +119,7 @@ Fisher evaluaba sobre todo aspectos cualitativos: el equipo directivo, la I+D, l
 
 Cada criterio se puntúa con `score_step`. **Puntos financieros = media de los dos × 30.**
 
-### 2.4 Valuación (35 puntos)
+### 2.4 Valuación (30 puntos)
 
 | Criterio | Umbral | Cálculo | Puntuación |
 |---|---|---|---|
@@ -130,22 +131,39 @@ Cada criterio se puntúa con `score_step`. **Puntos financieros = media de los d
 - El free cash flow es el campo `freeCashflow` de Yahoo, **convertido a la divisa de cotización** cuando la empresa reporta en otra. Así, en TSM el FCF en dólares taiwaneses se pasa a dólares antes de dividirlo por una capitalización en dólares. Las acciones de Londres, que cotizan en peniques, se ajustan aparte.
 - Si el FCF es negativo o no hay dato, P/FCF y FCF yield puntúan **0**.
 
-**Puntos de valuación = media de los cuatro × 35.**
+**Puntos de valuación = media de los cuatro × 30.**
 
-### 2.5 Score total
+### 2.5 Previsiones de analistas (10 puntos)
 
-**Score = Calidad + Salud financiera + Valuación**, redondeado a un decimal.
+Datos de `Ticker.earnings_estimate` y `Ticker.eps_trend` de Yahoo. Dos criterios, cada uno de 0 a 1:
+
+| Criterio | Dato | Nota |
+|---|---|---|
+| **Crecimiento EPS previsto** | Media del crecimiento esperado del EPS para el ejercicio actual y el siguiente | −5 % o menos → 0 · 5 % → 0,5 · 15 % o más → 1 (lineal entre medias) |
+| **Revisión de previsiones** | Cambio del EPS previsto para el próximo ejercicio hoy frente a hace 90 días (la "pendiente" de las previsiones) | −10 % o menos → 0 · 0 % → 0,5 · +10 % o más → 1 (lineal) |
+
+- Premia que se espere que el crecimiento continúe y que los analistas estén subiendo sus estimaciones, y penaliza lo contrario.
+- **Neutro sin datos:** si hay menos de 3 analistas, si Yahoo no tiene previsiones (habitual en empresas pequeñas y no estadounidenses) o si falta uno de los dos datos, ese criterio vale 0,5. Así no se castiga a una empresa solo porque no la sigue nadie.
+- Un crecimiento previsto superior al 100 % también cuenta como neutro: suele venir de una base casi nula.
+- Si no hay previsión del próximo ejercicio, la revisión se mide con la del ejercicio actual.
+
+**Puntos de previsiones = media de los dos × 10.**
+
+### 2.6 Score total
+
+**Score = Calidad + Salud financiera + Valuación + Previsiones**, redondeado a un decimal. Máximo 100.
 
 ---
 
-## 3. Ejemplo: NVIDIA (NVDA)
+## 3. Ejemplo
 
 | Pilar | Dato | Nota | Puntos |
 |---|---|---|---:|
-| **Calidad** | 13 de 15 criterios | 13/15 × 35 | **30,3** |
-| **Salud financiera** | ROIC 76,3 % (cumple) · EPS +107,7 % (cumple) | (1 + 1)/2 × 30 | **30** |
-| **Valuación** | PEG 0,15 (cumple) · P/E 18 (cumple) · P/FCF 40,8 (por encima de 31,25: 0) · FCF yield 2,45 % (por debajo de 3 %: 0) | (1 + 1 + 0 + 0)/4 × 35 | **17,5** |
-| **Total** | | | **77,8** |
+| **Calidad** | 13 de 15 criterios | 13/15 × 30 | **26** |
+| **Salud financiera** | ROIC 20 % (cumple) · EPS medio 3 años 8,5 % (entre 7,5 % y 10 %: (8,5 − 7,5)/2,5 = 0,4) | (1 + 0,4)/2 × 30 | **21** |
+| **Valuación** | PEG 1,2 (cumple) · P/E 28 ((31,25 − 28)/6,25 = 0,52) · P/FCF 22 (cumple) · FCF yield 4,5 % (cumple) | (1 + 0,52 + 1 + 1)/4 × 30 | **26,4** |
+| **Previsiones** | Crecimiento previsto 10 % (0,75) · revisión a 90 días −4 % (0,3) | (0,75 + 0,3)/2 × 10 | **5,3** |
+| **Total** | | | **78,7** |
 
 ---
 
@@ -187,6 +205,8 @@ Todo está en el bloque `CONFIG`, al principio de `screener.py`: los pesos de ca
 ---
 
 ## 5. Limitaciones conocidas
+
+- **Las previsiones de analistas suelen pecar de optimistas** y se mueven en manada; las revisiones tienen cierto valor como señal de momentum, pero no son un dato fiable sobre el futuro.
 
 - **P/FCF y FCF yield miden lo mismo:** uno es el inverso del otro, así que en la práctica el FCF pesa el doble dentro de la valuación.
 - **El FCF de Yahoo es el "levered free cash flow"** (después de intereses), no la caja operativa menos capex. En empresas con mucha inversión, como MSFT o META con la IA, puede salir muy bajo y hundir su valuación.
