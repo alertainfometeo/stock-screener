@@ -189,7 +189,7 @@
 
     function metricRows(group){
       return c.metrics.filter(function(m){ return m.group === group; }).map(function(m){
-        return '<tr><td>' + esc(m.label) + '</td><td class="r"><b>' + fmt(m.value, m.unit) + '</b></td>' +
+        return '<tr><td>' + esc(m.label) + (m.note ? '<span style="display:block;font-size:12px;color:var(--muted)">' + esc(m.note) + '</span>' : '') + '</td><td class="r"><b>' + fmt(m.value, m.unit) + '</b></td>' +
           '<td class="r sub">' + esc(m.rule) + '</td><td class="r"><span class="tag ' + cls(m.score) + '">' + label(m.score) + '</span></td></tr>';
       }).join("");
     }
