@@ -33,12 +33,12 @@ import yfinance as yf
 CONFIG = {
     "weights": {
         "quality_fisher": 35.0,   # 15 puntos de Phil Fisher
-        "financial_gates": 30.0,  # ROIC + Crecimiento EPS
+        "financial_gates": 30.0,  # ROIC + Crecimiento EPS (media 3 años)
         "valuation": 35.0,        # PEG Forward, P/E, P/FCF, FCF Yield
     },
     "financial_thresholds": {
         "min_roic": 0.15,         # ROIC > 15%
-        "min_eps_growth": 0.10,   # Crecimiento EPS > 10%
+        "min_eps_growth": 0.10,   # Crecimiento EPS medio 3 años > 10%
     },
     "valuation_thresholds": {
         "max_peg_strict": 1.5,    # PEG Forward ideal < 1.5
@@ -75,7 +75,7 @@ FISHER_LABELS = [
     "Margen neto > 12%",
     "ROE > 18%",
     "ROA > 8%",
-    "Crecimiento de beneficios > 10%",
+    "Crecimiento EPS medio 3 años > 10%",
     "Free cash flow positivo",
     "Caja operativa ≥ 90% del beneficio",
     "Deuda/Patrimonio < 100%",
@@ -230,7 +230,7 @@ def evaluate_fisher_15_points(info: Dict[str, Any], ticker: str) -> Tuple[float,
         g("profitMargins") > 0.12,
         g("returnOnEquity") > 0.18,
         g("returnOnAssets") > 0.08,
-        g("earningsGrowth") > 0.10,
+        g("epsGrowthAvg3") > 0.10,
         g("freeCashflow") > 0,
         g("operatingCashflow") > g("netIncomeToCommon") * 0.9,
         g("debtToEquity", 999) < 100,
@@ -263,6 +263,46 @@ def score_step(value: Optional[float], target: float, higher_is_better: bool = T
     if value < ceiling and ceiling != target:
         return (ceiling - value) / (ceiling - target)
     return 0.0
+
+
+def eps_growth_avg3(stock: yf.Ticker) -> Tuple[Optional[float], int]:
+    """
+    Media de los crecimientos anuales del EPS diluido de los últimos 3 años
+    (4 ejercicios anuales -> 3 variaciones). Los años en que el EPS de partida
+    es cero o negativo no se pueden calcular y se saltan.
+    Devuelve (media, nº de años usados).
+    """
+    try:
+        fin = stock.financials
+        if fin is None or fin.empty:
+            return None, 0
+        row = None
+        for name in ("Diluted EPS", "Basic EPS"):
+            if name in fin.index:
+                row = fin.loc[name]
+                break
+        if row is None:
+            return None, 0
+        eps = {}
+        for col, v in row.items():
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+            year = getattr(col, "year", None)
+            if year is not None and pd.notna(v) and year not in eps:
+                eps[int(year)] = v
+        years = sorted(eps)[-4:]
+        growths = []
+        for prev, cur in zip(years, years[1:]):
+            if eps[prev] > 0:
+                growths.append(eps[cur] / eps[prev] - 1.0)
+        growths = growths[-3:]
+        if not growths:
+            return None, 0
+        return sum(growths) / len(growths), len(growths)
+    except Exception:
+        return None, 0
 
 
 def calculate_roic(stock: yf.Ticker, info: Dict[str, Any]) -> float:
@@ -326,7 +366,15 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
 
         pe = info.get("trailingPE") or info.get("forwardPE")
         forward_pe = info.get("forwardPE")
-        eps_growth = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth") or 0.0
+        # Crecimiento EPS: media de los crecimientos anuales de los últimos 3 años.
+        # Si no hay estados anuales, se usa el dato trimestral de Yahoo.
+        eps_growth, eps_years = eps_growth_avg3(stock)
+        if eps_growth is not None:
+            eps_note = f"media {eps_years} año" + ("s" if eps_years != 1 else "")
+        else:
+            eps_growth = info.get("earningsGrowth") or info.get("earningsQuarterlyGrowth") or 0.0
+            eps_note = "sin histórico anual: dato trimestral de Yahoo"
+        info = {**info, "epsGrowthAvg3": eps_growth}
 
         peg_forward = info.get("pegRatio")
         if (not peg_forward or peg_forward <= 0) and forward_pe and eps_growth > 0:
@@ -384,7 +432,7 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
             "fisher_checks": fisher_checks,
             "metrics": [
                 {"group": "financial", "label": "ROIC", "value": _r(roic * 100, 1), "unit": "%", "rule": "> 15%", "score": round(s_roic, 2)},
-                {"group": "financial", "label": "Crecimiento EPS", "value": _r(eps_growth * 100, 1), "unit": "%", "rule": "> 10%", "score": round(s_eps, 2)},
+                {"group": "financial", "label": "Crecimiento EPS (media 3 años)", "value": _r(eps_growth * 100, 1), "unit": "%", "rule": "> 10%", "note": eps_note, "score": round(s_eps, 2)},
                 {"group": "valuation", "label": "PEG forward", "value": _r(peg_forward), "unit": "", "rule": "< 1,5 (parcial < 2)", "score": round(s_peg, 2)},
                 {"group": "valuation", "label": "P/E", "value": _r(pe, 1), "unit": "", "rule": "< 25", "score": round(s_pe, 2)},
                 {"group": "valuation", "label": "P/FCF", "value": _r(p_fcf, 1), "unit": "", "rule": "< 25", "score": round(s_pfcf, 2)},
