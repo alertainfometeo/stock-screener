@@ -56,6 +56,14 @@ CONFIG = {
         "min_analysts": 3,          # Con menos analistas: neutro
         "max_growth": 1.00,         # Previsión > 100%: base demasiado baja -> neutro
     },
+    # WACC (coste medio ponderado del capital) para comparar con el ROIC
+    "wacc": {
+        "risk_free_default": 0.043,  # Si no se puede leer el bono USA a 10 años (^TNX)
+        "equity_risk_premium": 0.05, # Prima de riesgo del mercado
+        "default_beta": 1.0,         # Si Yahoo no da beta
+        "beta_min": 0.3, "beta_max": 3.0,
+        "debt_spread_default": 0.015,  # Coste de deuda = libre de riesgo + 1,5% si no hay intereses
+    },
     "min_score_to_display": 60.0,
     # Universo SEC
     "sec_url": "https://www.sec.gov/files/company_tickers_exchange.json",
@@ -401,6 +409,69 @@ def calculate_roic(stock: yf.Ticker, info: Dict[str, Any]) -> float:
     return 0.0
 
 
+_RF_CACHE: Dict[str, float] = {}
+
+
+def risk_free_rate() -> float:
+    """Rentabilidad del bono de EE. UU. a 10 años (^TNX en Yahoo, en %)."""
+    if "rf" not in _RF_CACHE:
+        rf = CONFIG["wacc"]["risk_free_default"]
+        try:
+            hist = yf.Ticker("^TNX").history(period="5d")
+            if not hist.empty:
+                v = float(hist["Close"].dropna().iloc[-1]) / 100.0
+                if 0.0 < v < 0.20:
+                    rf = v
+        except Exception:
+            pass
+        _RF_CACHE["rf"] = rf
+    return _RF_CACHE["rf"]
+
+
+def calculate_wacc(stock: yf.Ticker, info: Dict[str, Any], market_cap: float, conv: Optional[float]) -> Optional[float]:
+    """
+    WACC = E/(E+D)·Ke + D/(E+D)·Kd·(1 − t)
+      Ke = libre de riesgo + beta × prima de riesgo  (CAPM)
+      Kd = gastos financieros / deuda total del último ejercicio
+    """
+    w = CONFIG["wacc"]
+    try:
+        rf = risk_free_rate()
+        beta = info.get("beta")
+        if beta is None or beta <= 0:
+            beta = w["default_beta"]
+        beta = max(w["beta_min"], min(w["beta_max"], float(beta)))
+        ke = rf + beta * w["equity_risk_premium"]
+
+        fin, bs = stock.financials, stock.balance_sheet
+        debt = None
+        if bs is not None and not bs.empty and "Total Debt" in bs.index:
+            debt = float(bs.loc["Total Debt"].iloc[0])
+        if debt is None or pd.isna(debt):
+            debt = float(info.get("totalDebt") or 0.0)
+        debt = debt * (conv or 1.0)
+
+        interest, tax_rate = None, 0.21
+        if fin is not None and not fin.empty:
+            if "Interest Expense" in fin.index:
+                interest = abs(float(fin.loc["Interest Expense"].iloc[0])) * (conv or 1.0)
+            if "Tax Provision" in fin.index and "Pretax Income" in fin.index:
+                pt = float(fin.loc["Pretax Income"].iloc[0])
+                if pt > 0:
+                    tax_rate = max(0.0, min(0.40, float(fin.loc["Tax Provision"].iloc[0]) / pt))
+        if interest and debt > 0 and not pd.isna(interest):
+            kd = max(0.01, min(0.15, interest / debt))
+        else:
+            kd = rf + w["debt_spread_default"]
+
+        e, d = market_cap, max(debt, 0.0)
+        if e <= 0:
+            return None
+        return e / (e + d) * ke + d / (e + d) * kd * (1 - tax_rate)
+    except Exception:
+        return None
+
+
 def _r(x, n=2):
     return None if x is None else round(float(x), n)
 
@@ -454,6 +525,7 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         fcf_yield = (fcf / market_cap) if (fcf and fcf > 0) else 0.0
 
         roic = calculate_roic(stock, info)
+        wacc = calculate_wacc(stock, info, market_cap, conv)
 
         # 1. CALIDAD
         fisher_ratio, fisher_checks, fisher_method = evaluate_fisher_15_points(info, ticker)
@@ -508,6 +580,8 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
             "fisher_checks": fisher_checks,
             "metrics": [
                 {"group": "financial", "label": "ROIC", "value": _r(roic * 100, 1), "unit": "%", "rule": "> 15%", "score": round(s_roic, 2)},
+                {"group": "financial", "label": "WACC", "value": _r(wacc * 100, 1) if wacc is not None else None, "unit": "%", "rule": "ROIC > WACC", "note": "coste medio del capital (CAPM); no puntúa", "score": None,
+                 "status": None if wacc is None else ("ROIC > WACC" if roic > wacc else "ROIC ≤ WACC")},
                 {"group": "financial", "label": "Crecimiento EPS (media 3 años)", "value": _r(eps_growth * 100, 1), "unit": "%", "rule": "> 10%", "note": eps_note, "score": round(s_eps, 2)},
                 {"group": "valuation", "label": "PEG forward", "value": _r(peg_forward), "unit": "", "rule": "< 1,5 (parcial < 2)", "score": round(s_peg, 2)},
                 {"group": "valuation", "label": "P/E", "value": _r(pe, 1), "unit": "", "rule": "< 25", "score": round(s_pe, 2)},
@@ -524,6 +598,13 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
 # ==============================================================================
 # SALIDAS
 # ==============================================================================
+def _metric(r: Dict[str, Any], label_start: str) -> Optional[float]:
+    for m in r.get("metrics", []):
+        if m["label"].startswith(label_start):
+            return m["value"]
+    return None
+
+
 def write_site(results: List[Dict[str, Any]], out_dir: str = "site") -> None:
     """index.json ligero para el ranking + un JSON por empresa en c/."""
     os.makedirs(os.path.join(out_dir, "c"), exist_ok=True)
@@ -534,7 +615,9 @@ def write_site(results: List[Dict[str, Any]], out_dir: str = "site") -> None:
         "companies": [
             [r["ticker"], r["name"], r["score"], r["pillars"]["quality"],
              r["pillars"]["financial"], r["pillars"]["valuation"], r.get("sector"),
-             r["pillars"].get("forecast")]
+             r["pillars"].get("forecast"),
+             _metric(r, "P/E"), _metric(r, "Crecimiento EPS"),
+             _metric(r, "ROIC"), _metric(r, "WACC")]
             for r in results
         ],
     }
