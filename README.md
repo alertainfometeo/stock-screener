@@ -167,6 +167,36 @@ Datos de `Ticker.earnings_estimate` y `Ticker.eps_trend` de Yahoo. Dos criterios
 
 ---
 
+## 3b. Tachar empresas en el ranking
+
+En la portada hay una casilla **"Tachar si el P/E es más de X veces el crecimiento del EPS"**. Al escribir un número:
+
+- Se tachan las empresas cuyo **P/E > X × crecimiento del EPS** (media de 3 años, en %). Por ejemplo, con X = 1,5 y un crecimiento del 12 %, se tachan las de P/E por encima de 18.
+- También se tachan las que tienen P/E positivo y crecimiento del EPS nulo o negativo.
+- Las que no tienen P/E o crecimiento no se tachan.
+- Con X = 1 equivale a la regla clásica de Peter Lynch: PEG (P/E ÷ crecimiento) mayor que 1.
+- La casilla **Ocultar tachadas** las quita de la lista. El valor de X se recuerda en tu navegador.
+
+Es solo un filtro visual: no cambia el score.
+
+### ROIC frente a WACC
+
+La casilla **"Tachar si el ROIC no supera el WACC"** tacha las empresas que no ganan más de lo que les cuesta su capital, es decir, que no crean valor. Se puede combinar con la del P/E: se tacha si se cumple cualquiera de las dos.
+
+El WACC (coste medio ponderado del capital) se calcula así, con datos del último ejercicio:
+
+- **WACC = E/(E+D) × Ke + D/(E+D) × Kd × (1 − t)**
+- **E:** capitalización. **D:** deuda total del balance (convertida a la divisa de cotización).
+- **Ke (coste del capital propio, CAPM) = libre de riesgo + beta × 5 %.** La tasa libre de riesgo es la rentabilidad del bono de EE. UU. a 10 años (`^TNX` en Yahoo; 4,3 % si no se puede leer). La beta sale de Yahoo, limitada entre 0,3 y 3; si no hay, se usa 1.
+- **Kd (coste de la deuda) = gastos financieros / deuda total**, limitado entre 1 % y 15 %. Si no hay gastos financieros, libre de riesgo + 1,5 %.
+- **t:** tasa impositiva efectiva, igual que en el ROIC (21 % si no se puede calcular).
+
+La ficha muestra el WACC debajo del ROIC con el resultado de la comparación. El WACC no puntúa.
+
+Limitaciones: se usa el bono de EE. UU. también para empresas de otros países, la beta de Yahoo es histórica y la prima de riesgo del 5 % es una convención. Es una estimación orientativa. Los parámetros están en `CONFIG["wacc"]`.
+
+---
+
 ## 4. Cómo se ejecuta
 
 ### 4.1 Cuándo
