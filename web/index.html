@@ -129,21 +129,21 @@
   function renderHome(idx){
     document.title = "Ranking · Evaluación de empresas";
     var all = idx.companies.map(function(c){
-      return {ticker:c[0], name:c[1], score:c[2], q:c[3], f:c[4], v:c[5], sector:c[6] || ""};
+      return {ticker:c[0], name:c[1], score:c[2], q:c[3], f:c[4], v:c[5], sector:c[6] || "", p:c[7]};
     });
     var sectors = Array.from(new Set(all.map(function(c){ return c.sector; }).filter(Boolean))).sort();
     var high = all.filter(function(c){ return c.score >= 60; }).length;
     app.innerHTML =
       '<div class="card"><h1>Ranking</h1><p class="sub">' + all.length.toLocaleString("es-ES") + ' empresas puntuadas de 0 a 100 (' +
-      high + ' con 60 o más): calidad (15 puntos de Phil Fisher, 35), salud financiera (ROIC y crecimiento del EPS, 30) ' +
-      'y valuación (PEG, P/E, P/FCF, FCF yield, 35).</p>' +
+      high + ' con 60 o más): calidad (15 puntos de Phil Fisher, 30), salud financiera (ROIC y crecimiento del EPS, 30), ' +
+      'valuación (PEG, P/E, P/FCF, FCF yield, 30) y previsiones de analistas (10).</p>' +
       '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:14px">' +
       '<input id="flt" placeholder="Filtrar por nombre o ticker" style="text-transform:none;flex:1;min-width:180px">' +
       '<select id="sec" style="font:inherit;padding:9px 12px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink)">' +
       '<option value="">Todos los sectores</option>' + sectors.map(function(s){ return '<option>' + esc(s) + '</option>'; }).join("") +
       '</select></div></div>' +
       '<div class="card"><table><thead><tr><th class="r">#</th><th>Empresa</th>' +
-      '<th class="r hide-sm">Calidad</th><th class="r hide-sm">Finanzas</th><th class="r hide-sm">Valuación</th><th class="r">Score</th></tr></thead>' +
+      '<th class="r hide-sm">Calidad</th><th class="r hide-sm">Finanzas</th><th class="r hide-sm">Valuación</th><th class="r hide-sm">Previsiones</th><th class="r">Score</th></tr></thead>' +
       '<tbody id="rows"></tbody></table><p id="more" style="text-align:center;margin:14px 0 0"></p></div>';
 
     var limit = LIMIT;
@@ -157,9 +157,9 @@
         return '<tr><td class="r">' + (all.indexOf(c)+1) + '</td>' +
           '<td><a href="' + BASE + encodeURIComponent(c.ticker) + '"><b>' + esc(c.ticker) + '</b></a> ' +
           '<span class="sub hide-sm">' + esc(c.name) + '</span></td>' +
-          '<td class="r hide-sm">' + fmt(c.q) + '</td><td class="r hide-sm">' + fmt(c.f) + '</td><td class="r hide-sm">' + fmt(c.v) + '</td>' +
+          '<td class="r hide-sm">' + fmt(c.q) + '</td><td class="r hide-sm">' + fmt(c.f) + '</td><td class="r hide-sm">' + fmt(c.v) + '</td><td class="r hide-sm">' + fmt(c.p) + '</td>' +
           '<td class="r"><b style="color:' + color(c.score/100) + '">' + fmt(c.score) + '</b></td></tr>';
-      }).join("") || '<tr><td colspan="6" class="msg">Sin resultados</td></tr>';
+      }).join("") || '<tr><td colspan="7" class="msg">Sin resultados</td></tr>';
       var more = document.getElementById("more");
       more.innerHTML = list.length > limit ? '<button id="mbtn">Mostrar más (' + (list.length - limit).toLocaleString("es-ES") + ')</button>' : "";
       if (list.length > limit) document.getElementById("mbtn").onclick = function(){ limit += LIMIT; draw(); };
@@ -181,7 +181,7 @@
       ["Calidad (Fisher)", c.pillars.quality, W.quality_fisher],
       ["Salud financiera", c.pillars.financial, W.financial_gates],
       ["Valuación", c.pillars.valuation, W.valuation]
-    ].map(function(p){
+    ].concat(W.forecast ? [["Previsiones", c.pillars.forecast, W.forecast]] : []).map(function(p){
       var pct = p[2] ? p[1]/p[2] : 0;
       return '<div class="pill-row"><span>' + p[0] + '</span><div class="bar"><i style="width:' + (pct*100).toFixed(0) +
         '%;background:' + color(pct) + '"></i></div><span class="num">' + fmt(p[1]) + ' / ' + p[2] + '</span></div>';
@@ -190,7 +190,7 @@
     function metricRows(group){
       return c.metrics.filter(function(m){ return m.group === group; }).map(function(m){
         return '<tr><td>' + esc(m.label) + (m.note ? '<span style="display:block;font-size:12px;color:var(--muted)">' + esc(m.note) + '</span>' : '') + '</td><td class="r"><b>' + fmt(m.value, m.unit) + '</b></td>' +
-          '<td class="r sub">' + esc(m.rule) + '</td><td class="r"><span class="tag ' + cls(m.score) + '">' + label(m.score) + '</span></td></tr>';
+          '<td class="r sub">' + esc(m.rule) + '</td><td class="r">' + (m.points != null ? '<span class="tag ' + cls(m.score) + '">' + fmt(m.points) + ' / 5</span>' : '<span class="tag ' + cls(m.score) + '">' + label(m.score) + '</span>') + '</td></tr>';
       }).join("");
     }
     var thead = '<thead><tr><th>Ratio</th><th class="r">Valor</th><th class="r">Objetivo</th><th class="r">Estado</th></tr></thead>';
@@ -214,6 +214,9 @@
       '<div class="pillars">' + pillars + '</div></div>' +
       '<div class="card"><h2>Salud financiera</h2><table class="m">' + thead + '<tbody>' + metricRows("financial") + '</tbody></table></div>' +
       '<div class="card"><h2>Valuación</h2><table class="m">' + thead + '<tbody>' + metricRows("valuation") + '</tbody></table></div>' +
+      (c.forecast ? '<div class="card"><h2>Previsiones de analistas · ' + fmt(c.pillars.forecast) + ' de 10</h2><table class="m">' +
+        thead.replace(">Estado<", ">Puntos<") + '<tbody>' + metricRows("forecast") + '</tbody></table>' +
+        '<p class="sub">Sin datos de analistas (o con menos de 3) cada criterio puntúa neutro: 2,5 de 5.</p></div>' : '') +
       '<div class="card"><h2>Calidad · ' + fmt(c.fisher_points) + ' de 15 puntos Fisher</h2>' + fisher + '</div>';
   }
 })();
