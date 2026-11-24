@@ -598,6 +598,21 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
 # ==============================================================================
 # SALIDAS
 # ==============================================================================
+def _clean(x: Any) -> Any:
+    """Sustituye NaN/infinito por None: el navegador no acepta NaN en un JSON."""
+    if isinstance(x, float):
+        return x if x == x and x not in (float("inf"), float("-inf")) else None
+    if isinstance(x, dict):
+        return {k: _clean(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_clean(v) for v in x]
+    return x
+
+
+def _dump(obj: Any, f) -> None:
+    json.dump(_clean(obj), f, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
 def _metric(r: Dict[str, Any], label_start: str) -> Optional[float]:
     for m in r.get("metrics", []):
         if m["label"].startswith(label_start):
@@ -622,10 +637,10 @@ def write_site(results: List[Dict[str, Any]], out_dir: str = "site") -> None:
         ],
     }
     with open(os.path.join(out_dir, "index.json"), "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False, separators=(",", ":"))
+        _dump(index, f)
     for r in results:
         with open(os.path.join(out_dir, "c", f"{r['ticker']}.json"), "w", encoding="utf-8") as f:
-            json.dump(r, f, ensure_ascii=False, separators=(",", ":"))
+            _dump(r, f)
 
 
 def write_reports(results: List[Dict[str, Any]]) -> None:
@@ -687,7 +702,7 @@ def cmd_scan(shard: int, shards: int) -> None:
                 print(f"  {done}/{len(tickers)} procesados, {len(results)} válidos")
     os.makedirs("shards", exist_ok=True)
     with open(f"shards/shard_{shard}.json", "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False)
+        _dump(results, f)
     print(f"Parte {shard + 1}: {len(results)} empresas evaluadas")
 
 
