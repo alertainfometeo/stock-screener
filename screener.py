@@ -32,9 +32,10 @@ import yfinance as yf
 # ==============================================================================
 CONFIG = {
     "weights": {
-        "quality_fisher": 35.0,   # 15 puntos de Phil Fisher
+        "quality_fisher": 30.0,   # 15 puntos de Phil Fisher
         "financial_gates": 30.0,  # ROIC + Crecimiento EPS (media 3 años)
-        "valuation": 35.0,        # PEG Forward, P/E, P/FCF, FCF Yield
+        "valuation": 30.0,        # PEG Forward, P/E, P/FCF, FCF Yield
+        "forecast": 10.0,         # Previsiones de analistas: crecimiento previsto + revisiones
     },
     "financial_thresholds": {
         "min_roic": 0.15,         # ROIC > 15%
@@ -46,6 +47,14 @@ CONFIG = {
         "max_pe": 25.0,           # P/E < 25
         "max_p_fcf": 25.0,        # Price / Free Cash Flow < 25
         "min_fcf_yield": 0.04,    # Free Cash Flow Yield > 4%
+    },
+    # Pilar de previsiones de analistas (cada criterio de 0 a 1, neutro = 0,5)
+    "forecast": {
+        "growth_zero": -0.05,       # Crecimiento previsto de -5% o menos -> 0
+        "growth_full": 0.15,        # 15% o más -> 1   (5% -> 0,5)
+        "revision_full": 0.10,      # Revisión +10% -> 1, 0% -> 0,5, -10% -> 0
+        "min_analysts": 3,          # Con menos analistas: neutro
+        "max_growth": 1.00,         # Previsión > 100%: base demasiado baja -> neutro
     },
     "min_score_to_display": 60.0,
     # Universo SEC
@@ -305,6 +314,67 @@ def eps_growth_avg3(stock: yf.Ticker) -> Tuple[Optional[float], int]:
         return None, 0
 
 
+def _clip(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def forecast_scores(stock: yf.Ticker) -> Dict[str, Any]:
+    """
+    Pilar de previsiones. Dos criterios de 0 a 1 (0,5 = neutro si no hay datos):
+      1. Crecimiento del EPS previsto: media del crecimiento esperado para el
+         ejercicio actual (0y) y el siguiente (+1y).
+      2. Pendiente de las previsiones: cuánto ha cambiado en 90 días la
+         previsión de EPS del próximo ejercicio (+1y, o del actual si no hay).
+    """
+    fc = CONFIG["forecast"]
+    out = {"growth": None, "revision": None, "analysts": 0,
+           "s_growth": 0.5, "s_revision": 0.5, "note": ""}
+    try:
+        est = stock.earnings_estimate
+        trend = stock.eps_trend
+    except Exception:
+        out["note"] = "sin previsiones de analistas: neutro"
+        return out
+    if est is None or est.empty:
+        out["note"] = "sin previsiones de analistas: neutro"
+        return out
+
+    def val(df, period, col):
+        try:
+            v = df.loc[period, col]
+            return None if v is None or pd.isna(v) else float(v)
+        except Exception:
+            return None
+
+    analysts = val(est, "+1y", "numberOfAnalysts") or val(est, "0y", "numberOfAnalysts")
+    out["analysts"] = int(analysts) if analysts else 0
+    if not analysts or analysts < fc["min_analysts"]:
+        out["note"] = f"solo {out['analysts']} analista(s): neutro"
+        return out
+
+    growths = [g for g in (val(est, "0y", "growth"), val(est, "+1y", "growth")) if g is not None]
+    if growths:
+        g = sum(growths) / len(growths)
+        out["growth"] = g
+        if g <= fc["max_growth"]:
+            out["s_growth"] = _clip((g - fc["growth_zero"]) / (fc["growth_full"] - fc["growth_zero"]), 0.0, 1.0)
+        else:
+            out["note"] = "crecimiento previsto > 100%: neutro"
+
+    if trend is not None and not trend.empty:
+        for period in ("+1y", "0y"):
+            cur, old = val(trend, period, "current"), val(trend, period, "90daysAgo")
+            if cur is not None and old is not None and old > 0:
+                rev = cur / old - 1.0
+                out["revision"] = rev
+                out["s_revision"] = _clip((rev + fc["revision_full"]) / (2 * fc["revision_full"]), 0.0, 1.0)
+                break
+
+    if not out["note"]:
+        out["note"] = f"{out['analysts']} analistas"
+    return out
+
+
 def calculate_roic(stock: yf.Ticker, info: Dict[str, Any]) -> float:
     """ROIC = NOPAT / Capital invertido."""
     try:
@@ -411,7 +481,11 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
         s_fcf_yield = score_step(fcf_yield, val_cfg["min_fcf_yield"])
         score_valuation = ((s_peg + s_pe + s_pfcf + s_fcf_yield) / 4.0) * CONFIG["weights"]["valuation"]
 
-        total_score = round(score_quality + score_financial + score_valuation, 1)
+        # 4. PILAR PREVISIONES (crecimiento previsto + revisiones)
+        fca = forecast_scores(stock)
+        score_forecast = ((fca["s_growth"] + fca["s_revision"]) / 2.0) * CONFIG["weights"]["forecast"]
+
+        total_score = round(score_quality + score_financial + score_valuation + score_forecast, 1)
 
         return {
             "ticker": ticker,
@@ -426,7 +500,9 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
                 "quality": round(score_quality, 1),
                 "financial": round(score_financial, 1),
                 "valuation": round(score_valuation, 1),
+                "forecast": round(score_forecast, 1),
             },
+            "forecast": fca,
             "fisher_method": fisher_method,
             "fisher_points": round(fisher_ratio * 15, 1),
             "fisher_checks": fisher_checks,
@@ -437,6 +513,8 @@ def analyze_ticker(ticker: str) -> Optional[Dict[str, Any]]:
                 {"group": "valuation", "label": "P/E", "value": _r(pe, 1), "unit": "", "rule": "< 25", "score": round(s_pe, 2)},
                 {"group": "valuation", "label": "P/FCF", "value": _r(p_fcf, 1), "unit": "", "rule": "< 25", "score": round(s_pfcf, 2)},
                 {"group": "valuation", "label": "FCF yield", "value": _r(fcf_yield * 100, 2), "unit": "%", "rule": "> 4%", "score": round(s_fcf_yield, 2)},
+                {"group": "forecast", "label": "Crecimiento EPS previsto", "value": _r(fca["growth"] * 100, 1) if fca["growth"] is not None else None, "unit": "%", "rule": "≥ 15% (parcial > −5%)", "note": "media ejercicio actual y siguiente · " + fca["note"], "score": round(fca["s_growth"], 2), "points": round(fca["s_growth"] * 5, 1)},
+                {"group": "forecast", "label": "Revisión de previsiones (90 días)", "value": _r(fca["revision"] * 100, 1) if fca["revision"] is not None else None, "unit": "%", "rule": "≥ +10% (parcial > −10%)", "note": "EPS previsto del próximo ejercicio, hoy vs hace 90 días", "score": round(fca["s_revision"], 2), "points": round(fca["s_revision"] * 5, 1)},
             ],
         }
     except Exception:
@@ -455,7 +533,8 @@ def write_site(results: List[Dict[str, Any]], out_dir: str = "site") -> None:
         "fisher_labels": FISHER_LABELS,
         "companies": [
             [r["ticker"], r["name"], r["score"], r["pillars"]["quality"],
-             r["pillars"]["financial"], r["pillars"]["valuation"], r.get("sector")]
+             r["pillars"]["financial"], r["pillars"]["valuation"], r.get("sector"),
+             r["pillars"].get("forecast")]
             for r in results
         ],
     }
@@ -472,9 +551,10 @@ def write_reports(results: List[Dict[str, Any]]) -> None:
         "Empresa": r["name"][:28],
         "Sector": r.get("sector"),
         "Score": r["score"],
-        "Calidad (35)": r["pillars"]["quality"],
+        "Calidad (30)": r["pillars"]["quality"],
         "Finanzas (30)": r["pillars"]["financial"],
-        "Valuación (35)": r["pillars"]["valuation"],
+        "Valuación (30)": r["pillars"]["valuation"],
+        "Previsiones (10)": r["pillars"].get("forecast"),
         **{m["label"]: m["value"] for m in r["metrics"]},
     } for r in results])
     df.to_csv("screener_results.csv", index=False)
